@@ -2,11 +2,11 @@
   "name": "ticket-bot",
   "version": "1.0.0",
   "description": "A fully customizable Discord ticket bot with claim/add/remove/transfer support",
-  "main": "bot.ts",
+  "main": "src/bot.ts",
   "type": "commonjs",
   "scripts": {
-    "start": "tsx bot.ts",
-    "dev": "tsx watch bot.ts"
+    "start": "tsx src/bot.ts",
+    "dev": "tsx watch src/bot.ts"
   },
   "dependencies": {
     "discord.js": "^14.15.3",
