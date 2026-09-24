@@ -32,8 +32,14 @@ tickets with `$add`, `$remove`, `$unclaim`, and `$transfer`.
    ```bash
    npm start
    ```
+   This runs `tsx bot.ts` — the whole bot lives in one file, `bot.ts`, so there's
+   no build step. Edit that file and restart to change anything.
 
 ## Commands
+
+### `$help`
+Anyone can run this — it lists every command with a short description, grouped
+into admin-only and ticket-channel commands.
 
 ### Admin only
 - **`$ticketsetup`** — Interactive wizard (only real server Administrators can run it).
@@ -92,6 +98,14 @@ setup and open tickets. To keep that data across deploys, add a **Railway Volume
 (Service → **Settings → Volumes** → mount it at `/app/data`) so `data/data.json`
 survives redeploys. Without a volume, you'll need to re-run `$ticketsetup` after
 each deploy.
+
+## Editing commands
+
+Everything — storage, permissions, embeds, ticket logic, and all 8 commands — is
+in `bot.ts`. Each command is its own `const xCommand: Command = {...}` block; to
+add one, copy a block, change it, and add it to the `COMMANDS` array near the
+bottom of the file. To change existing behavior (e.g. who can `$close` a ticket),
+just edit that command's block directly.
 
 ## Notes
 
