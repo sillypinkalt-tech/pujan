@@ -396,12 +396,12 @@ const ticketSetupCommand: Command = {
     const titleMsg = await ask('**Step 1/5** — What should the panel **title** say?');
     if (!titleMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
     if (titleMsg === 'CANCELLED') return void channel.send('❌ Setup cancelled.');
-    const title = titleMsg.content.trim();
+    const title = titleMsg.content.trim().slice(0, 256);
 
     const descMsg = await ask('**Step 2/5** — What **message** should appear in the panel (the description users see)?');
     if (!descMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
     if (descMsg === 'CANCELLED') return void channel.send('❌ Setup cancelled.');
-    const description = descMsg.content.trim();
+    const description = descMsg.content.trim().slice(0, 4096);
 
     const btnMsg = await ask('**Step 3/5** — What text should the **ticket-creating button** say? (e.g. "Open a Ticket")');
     if (!btnMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
@@ -439,7 +439,17 @@ const ticketSetupCommand: Command = {
     }
 
     const panel: PanelData = { channelId: null, messageId: null, title, description, buttonLabel, imageUrl };
-    const panelMessage = await channel.send({ embeds: [buildPanelEmbed(panel)], components: [buildPanelRow(panel)] });
+
+    let panelMessage: Message;
+    try {
+      panelMessage = await channel.send({ embeds: [buildPanelEmbed(panel)], components: [buildPanelRow(panel)] });
+    } catch (e) {
+      console.error('ticketsetup: failed to build/send panel embed:', e);
+      const reason = e instanceof Error ? e.message : String(e);
+      await channel.send(`❌ Couldn't create the panel: ${reason}\nRun \`$ticketsetup\` again.`);
+      return;
+    }
+
     panel.channelId = channel.id;
     panel.messageId = panelMessage.id;
 
