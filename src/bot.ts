@@ -33,7 +33,8 @@ import {
   GuildMember,
   TextChannel,
   Guild,
-  Interaction
+  Interaction,
+  AttachmentBuilder
 } from 'discord.js';
 
 const PREFIX = process.env.PREFIX || '$';
@@ -64,6 +65,7 @@ interface GuildConfig {
   ticketCategoryId: string | null;
   ticketCounter: number;
   tickets: Record<string, TicketData>;
+  transcriptChannelId: string | null;
 }
 
 interface StoreData {
@@ -99,6 +101,24 @@ function saveStore(data: StoreData): void {
 
 let cache = loadStore();
 
+// ============================================================================
+//  $ticketsetup — in-memory bridge between "info" modal and "roles" modal.
+//  Keyed by `${guildId}:${userId}`. Entries are cleaned up on completion or
+//  after 10 minutes of inactivity so an abandoned setup can't leak forever.
+// ============================================================================
+
+interface PendingTicketSetup {
+  channelId: string;
+  title: string;
+  description: string;
+  buttonLabel: string;
+  imageUrl: string | null;
+  createdAt: number;
+}
+
+const pendingTicketSetups = new Map<string, PendingTicketSetup>();
+const PENDING_SETUP_TTL = 10 * 60_000;
+
 function getGuildConfig(guildId: string): GuildConfig {
   if (!cache.guilds[guildId]) {
     cache.guilds[guildId] = {
@@ -106,8 +126,13 @@ function getGuildConfig(guildId: string): GuildConfig {
       claimRoles: [],
       ticketCategoryId: null,
       ticketCounter: 0,
-      tickets: {}
+      tickets: {},
+      transcriptChannelId: null
     };
+    saveStore(cache);
+  } else if (cache.guilds[guildId].transcriptChannelId === undefined) {
+    // Backfill for configs saved before transcriptChannelId existed.
+    cache.guilds[guildId].transcriptChannelId = null;
     saveStore(cache);
   }
   return cache.guilds[guildId];
@@ -321,6 +346,95 @@ function getTicket(channel: TextChannel): TicketData | null {
   return config.tickets[channel.id] || null;
 }
 
+// Fetches the channel's full message history (paginated, capped at ~1000
+// messages so a very old/busy ticket can't hang the close process) and
+// formats it as a plain-text transcript, oldest message first.
+async function buildTranscriptFile(channel: TextChannel): Promise<Buffer> {
+  const collected: Message[] = [];
+  let before: string | undefined;
+
+  for (let page = 0; page < 10; page++) {
+    const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+    if (batch.size === 0) break;
+    collected.push(...batch.values());
+    before = batch.last()?.id;
+    if (batch.size < 100) break;
+  }
+
+  collected.reverse(); // oldest -> newest
+
+  const lines = collected.map((m) => {
+    const time = m.createdAt.toISOString().replace('T', ' ').slice(0, 19);
+    const author = `${m.author.tag} (${m.author.id})`;
+    const attachmentLines = m.attachments.size
+      ? '\n' + [...m.attachments.values()].map((a) => `    [attachment] ${a.url}`).join('\n')
+      : '';
+    return `[${time}] ${author}: ${m.content}${attachmentLines}`;
+  });
+
+  const header = `Transcript for #${channel.name} — generated ${new Date().toISOString()}\n${'='.repeat(60)}\n`;
+  return Buffer.from(header + (lines.join('\n') || '(no messages)'), 'utf8');
+}
+
+// Saves a transcript (if a transcript channel is configured) and deletes the
+// ticket channel after `delayMs`. Callers are responsible for sending their
+// own "closing in X seconds" message before calling this.
+async function scheduleTicketClose(
+  channel: TextChannel,
+  guildId: string,
+  closedBy: GuildMember | null,
+  delayMs = 10_000
+): Promise<void> {
+  const config = getGuildConfig(guildId);
+  const ticket = config.tickets[channel.id] || null;
+  const transcriptChannelId = config.transcriptChannelId;
+
+  let transcriptBuffer: Buffer | null = null;
+  if (transcriptChannelId) {
+    try {
+      transcriptBuffer = await buildTranscriptFile(channel);
+    } catch (e) {
+      console.error('Failed to build ticket transcript:', e);
+    }
+  }
+
+  const channelId = channel.id;
+  const channelName = channel.name;
+  const guild = channel.guild;
+
+  setTimeout(async () => {
+    if (transcriptBuffer && transcriptChannelId) {
+      const logChannel = guild.channels.cache.get(transcriptChannelId) as TextChannel | undefined;
+      if (logChannel) {
+        const embed = new EmbedBuilder()
+          .setTitle(`📄 Transcript — ${channelName}`)
+          .addFields(
+            { name: 'Opened by', value: ticket ? `<@${ticket.openerId}>` : 'Unknown', inline: true },
+            { name: 'Claimed by', value: ticket?.claimedBy ? `<@${ticket.claimedBy}>` : 'Unclaimed', inline: true },
+            { name: 'Closed by', value: closedBy ? `<@${closedBy.id}>` : 'Unknown', inline: true }
+          )
+          .setColor(0x5865f2)
+          .setTimestamp();
+        const attachment = new AttachmentBuilder(transcriptBuffer, { name: `${channelName}-transcript.txt` });
+        await logChannel.send({ embeds: [embed], files: [attachment] }).catch((e) => {
+          console.error('Failed to send transcript to log channel:', e);
+        });
+      } else {
+        console.error(`Transcript channel ${transcriptChannelId} no longer exists.`);
+      }
+    }
+
+    try {
+      await channel.delete();
+    } catch (e) {
+      console.error('Failed to delete ticket channel:', e);
+    }
+    updateGuildConfig(guildId, (g) => {
+      delete g.tickets[channelId];
+    });
+  }, delayMs);
+}
+
 // ============================================================================
 //  COMMANDS — add a new prefix command by pushing another object like these
 //  into the COMMANDS array below. `name` is what comes after the prefix
@@ -363,7 +477,7 @@ const helpCommand: Command = {
 
 const ticketSetupCommand: Command = {
   name: 'ticketsetup',
-  description: 'Interactive wizard to build and post the ticket panel (title, message, button text, image, claim roles).',
+  description: 'Open the ticket panel setup form (title, message, button text, image, claim roles, transcript channel).',
   usage: '$ticketsetup',
   adminOnly: true,
   async execute(message) {
@@ -373,95 +487,17 @@ const ticketSetupCommand: Command = {
       return;
     }
 
-    const channel = message.channel as TextChannel;
-    const userId = message.author.id;
-    const STEP_TIMEOUT = 60_000;
-
-    async function ask(questionText: string): Promise<Message | 'CANCELLED' | null> {
-      await channel.send(questionText);
-      const collected = await channel
-        .awaitMessages({ filter: (m) => m.author.id === userId, max: 1, time: STEP_TIMEOUT, errors: ['time'] })
-        .catch(() => null);
-      if (!collected || collected.size === 0) return null;
-      const msg = collected.first()!;
-      if (msg.content.trim().toLowerCase() === 'cancel') return 'CANCELLED';
-      return msg;
-    }
-
-    await channel.send(
-      '🛠️ **Ticket panel setup started.** Answer each question below.\n' +
-        'Type `cancel` at any point to stop. Each question times out after 60 seconds.'
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ticketsetup_start_${message.author.id}`)
+        .setLabel('🛠️ Start Ticket Panel Setup')
+        .setStyle(ButtonStyle.Primary)
     );
 
-    const titleMsg = await ask('**Step 1/5** — What should the panel **title** say?');
-    if (!titleMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
-    if (titleMsg === 'CANCELLED') return void channel.send('❌ Setup cancelled.');
-    const title = titleMsg.content.trim().slice(0, 256);
-
-    const descMsg = await ask('**Step 2/5** — What **message** should appear in the panel (the description users see)?');
-    if (!descMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
-    if (descMsg === 'CANCELLED') return void channel.send('❌ Setup cancelled.');
-    const description = descMsg.content.trim().slice(0, 4096);
-
-    const btnMsg = await ask('**Step 3/5** — What text should the **ticket-creating button** say? (e.g. "Open a Ticket")');
-    if (!btnMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
-    if (btnMsg === 'CANCELLED') return void channel.send('❌ Setup cancelled.');
-    const buttonLabel = btnMsg.content.trim().slice(0, 80);
-
-    const imgMsg = await ask('**Step 4/5** — Send an **image** (attach a file or paste an image URL) for the panel, or type `skip`.');
-    if (!imgMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
-    if (imgMsg === 'CANCELLED') return void channel.send('❌ Setup cancelled.');
-
-    let imageUrl: string | null = null;
-    if (imgMsg.attachments.size > 0) {
-      imageUrl = imgMsg.attachments.first()!.url;
-    } else if (imgMsg.content.trim().toLowerCase() !== 'skip') {
-      const candidate = imgMsg.content.trim();
-      if (/^https?:\/\/.+\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(candidate)) {
-        imageUrl = candidate;
-      } else {
-        await channel.send("⚠️ That didn't look like a valid image URL, so no image will be used.");
-      }
-    }
-
-    const roleMsg = await ask('**Step 5/5** — Mention (or type the IDs of) the **role(s)** allowed to claim tickets, separated by spaces.');
-    if (!roleMsg) return void channel.send('⏱️ Timed out. Run `$ticketsetup` again.');
-    if (roleMsg === 'CANCELLED') return void channel.send('❌ Setup cancelled.');
-
-    const mentionedRoles = [...roleMsg.mentions.roles.values()].map((r) => r.id);
-    const idMatches = roleMsg.content.match(/\d{15,25}/g) || [];
-    const claimRoles = [...new Set([...mentionedRoles, ...idMatches])].filter((id) =>
-      message.guild!.roles.cache.has(id)
-    );
-
-    if (claimRoles.length === 0) {
-      return void channel.send('❌ No valid roles were recognized. Setup cancelled — run `$ticketsetup` again.');
-    }
-
-    const panel: PanelData = { channelId: null, messageId: null, title, description, buttonLabel, imageUrl };
-
-    let panelMessage: Message;
-    try {
-      panelMessage = await channel.send({ embeds: [buildPanelEmbed(panel)], components: [buildPanelRow(panel)] });
-    } catch (e) {
-      console.error('ticketsetup: failed to build/send panel embed:', e);
-      const reason = e instanceof Error ? e.message : String(e);
-      await channel.send(`❌ Couldn't create the panel: ${reason}\nRun \`$ticketsetup\` again.`);
-      return;
-    }
-
-    panel.channelId = channel.id;
-    panel.messageId = panelMessage.id;
-
-    updateGuildConfig(message.guild!.id, (g) => {
-      g.panel = panel;
-      g.claimRoles = claimRoles;
+    await message.channel.send({
+      content: `${message.author}, click below to build the ticket panel. This will be posted **in this channel** once finished.`,
+      components: [row]
     });
-
-    const confirm = new EmbedBuilder()
-      .setColor(0x57f287)
-      .setDescription(`✅ **Ticket panel created!**\nClaim roles: ${claimRoles.map((id) => `<@&${id}>`).join(', ')}`);
-    await channel.send({ embeds: [confirm] });
   }
 };
 
@@ -584,20 +620,12 @@ const closeCommand: Command = {
       return;
     }
 
-    await channel.send('🔒 Closing this ticket in 5 seconds...');
-    const channelId = channel.id;
-    const guildId = message.guild!.id;
-
-    setTimeout(async () => {
-      try {
-        await channel.delete();
-      } catch (e) {
-        console.error('Failed to delete ticket channel:', e);
-      }
-      updateGuildConfig(guildId, (g) => {
-        delete g.tickets[channelId];
-      });
-    }, 5000);
+    await channel.send(
+      config.transcriptChannelId
+        ? `🔒 Closing this ticket in 10 seconds... A transcript will be saved to <#${config.transcriptChannelId}>.`
+        : '🔒 Closing this ticket in 10 seconds...'
+    );
+    await scheduleTicketClose(channel, message.guild!.id, message.member as GuildMember);
   }
 };
 
@@ -803,19 +831,231 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         await interaction.reply({ content: '🚫 Only staff, the claimer, or the ticket opener can close this ticket.', ephemeral: true });
         return;
       }
-      await interaction.reply('🔒 Closing this ticket in 5 seconds...');
-      const channelId = channel.id;
-      const guildId = interaction.guild!.id;
-      setTimeout(async () => {
-        try {
-          await channel.delete();
-        } catch (e) {
-          console.error('Failed to delete ticket channel:', e);
+      await interaction.reply(
+        config.transcriptChannelId
+          ? `🔒 Closing this ticket in 10 seconds... A transcript will be saved to <#${config.transcriptChannelId}>.`
+          : '🔒 Closing this ticket in 10 seconds...'
+      );
+      await scheduleTicketClose(channel, interaction.guild!.id, interaction.member as GuildMember);
+      return;
+    }
+
+    // --- Button: "Start Ticket Panel Setup" from $ticketsetup -> opens info modal ---
+    if (interaction.isButton() && interaction.customId.startsWith('ticketsetup_start_')) {
+      const ownerId = interaction.customId.replace('ticketsetup_start_', '');
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({ content: '🚫 Only the admin who ran `$ticketsetup` can use this button.', ephemeral: true });
+        return;
+      }
+
+      const modal = new ModalBuilder().setCustomId('ticketsetup_modal_info').setTitle('Ticket Panel — Info (1/2)');
+      const titleInput = new TextInputBuilder()
+        .setCustomId('ts_title')
+        .setLabel('Panel title')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(256)
+        .setPlaceholder('Support Tickets');
+      const descInput = new TextInputBuilder()
+        .setCustomId('ts_description')
+        .setLabel('Panel message (shown above the button)')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(4000)
+        .setPlaceholder('Click the button below to open a ticket.');
+      const btnInput = new TextInputBuilder()
+        .setCustomId('ts_button_label')
+        .setLabel('Ticket-creating button text')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(80)
+        .setPlaceholder('Open Ticket');
+      const imgInput = new TextInputBuilder()
+        .setCustomId('ts_image_url')
+        .setLabel('Image URL (optional)')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setMaxLength(300)
+        .setPlaceholder('https://... (leave blank for none)');
+
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(descInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(btnInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(imgInput)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // --- Modal submit: panel info -> stash it, prompt for roles/transcript ---
+    if (interaction.isModalSubmit() && interaction.customId === 'ticketsetup_modal_info') {
+      const title = interaction.fields.getTextInputValue('ts_title').trim().slice(0, 256);
+      const description = interaction.fields.getTextInputValue('ts_description').trim().slice(0, 4096);
+      const buttonLabel = interaction.fields.getTextInputValue('ts_button_label').trim().slice(0, 80);
+      const imageRaw = (interaction.fields.getTextInputValue('ts_image_url') || '').trim();
+
+      let imageUrl: string | null = null;
+      let imageWarning = '';
+      if (imageRaw) {
+        if (/^https?:\/\/.+\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(imageRaw)) {
+          imageUrl = imageRaw;
+        } else {
+          imageWarning = " (⚠️ that didn't look like a valid image URL, so no image will be used)";
         }
-        updateGuildConfig(guildId, (g) => {
-          delete g.tickets[channelId];
-        });
-      }, 5000);
+      }
+
+      const key = `${interaction.guild!.id}:${interaction.user.id}`;
+      pendingTicketSetups.set(key, {
+        channelId: interaction.channel!.id,
+        title,
+        description,
+        buttonLabel,
+        imageUrl,
+        createdAt: Date.now()
+      });
+      setTimeout(() => {
+        const entry = pendingTicketSetups.get(key);
+        if (entry && Date.now() - entry.createdAt >= PENDING_SETUP_TTL) pendingTicketSetups.delete(key);
+      }, PENDING_SETUP_TTL + 1000);
+
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ticketsetup_continue_${interaction.user.id}`)
+          .setLabel('Continue → Roles & Transcript')
+          .setStyle(ButtonStyle.Primary)
+      );
+      await interaction.reply({
+        content: `✅ Got the panel info${imageWarning}. Click below to set claim roles and (optionally) a transcript channel.`,
+        components: [row],
+        ephemeral: true
+      });
+      return;
+    }
+
+    // --- Button: "Continue" -> opens roles/transcript modal ---
+    if (interaction.isButton() && interaction.customId.startsWith('ticketsetup_continue_')) {
+      const ownerId = interaction.customId.replace('ticketsetup_continue_', '');
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({ content: '🚫 Only the admin who started this setup can use this button.', ephemeral: true });
+        return;
+      }
+      const key = `${interaction.guild!.id}:${interaction.user.id}`;
+      if (!pendingTicketSetups.has(key)) {
+        await interaction.reply({ content: '⚠️ This setup expired (10 min limit). Run `$ticketsetup` again.', ephemeral: true });
+        return;
+      }
+
+      const modal = new ModalBuilder().setCustomId('ticketsetup_modal_roles').setTitle('Ticket Panel — Roles (2/2)');
+      const rolesInput = new TextInputBuilder()
+        .setCustomId('ts_claim_roles')
+        .setLabel('Claim roles (mention or ID, space-separated)')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setPlaceholder('@Jr Helper @Sr Helper (or paste role IDs)');
+      const transcriptInput = new TextInputBuilder()
+        .setCustomId('ts_transcript_channel')
+        .setLabel('Transcript channel (optional)')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setPlaceholder('#ticket-logs, a channel ID, or leave blank');
+
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(rolesInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(transcriptInput)
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // --- Modal submit: roles/transcript -> build & publish the panel ---
+    if (interaction.isModalSubmit() && interaction.customId === 'ticketsetup_modal_roles') {
+      await interaction.deferReply({ ephemeral: true });
+
+      const key = `${interaction.guild!.id}:${interaction.user.id}`;
+      const pending = pendingTicketSetups.get(key);
+      if (!pending) {
+        await interaction.editReply('⚠️ This setup expired (10 min limit). Run `$ticketsetup` again.');
+        return;
+      }
+
+      const notes: string[] = [];
+
+      const rolesRaw = interaction.fields.getTextInputValue('ts_claim_roles');
+      const roleMentionMatches = [...rolesRaw.matchAll(/<@&(\d+)>/g)].map((m) => m[1]);
+      const roleIdMatches = rolesRaw.match(/\d{15,25}/g) || [];
+      const claimRoles = [...new Set([...roleMentionMatches, ...roleIdMatches])].filter((id) =>
+        interaction.guild!.roles.cache.has(id)
+      );
+
+      if (claimRoles.length === 0) {
+        pendingTicketSetups.delete(key);
+        await interaction.editReply('❌ No valid roles were recognized. Run `$ticketsetup` again.');
+        return;
+      }
+
+      const transcriptRaw = (interaction.fields.getTextInputValue('ts_transcript_channel') || '').trim();
+      let transcriptChannelId: string | null = null;
+      if (transcriptRaw) {
+        const chanMention = transcriptRaw.match(/^<#(\d+)>$/);
+        const chanId = chanMention ? chanMention[1] : /^\d{15,25}$/.test(transcriptRaw) ? transcriptRaw : null;
+        const chan = chanId ? interaction.guild!.channels.cache.get(chanId) : null;
+        if (chan && chan.type === ChannelType.GuildText) {
+          transcriptChannelId = chanId;
+        } else {
+          notes.push("⚠️ The transcript channel wasn't recognized as a text channel, so transcripts won't be saved.");
+        }
+      }
+
+      const targetChannel = interaction.guild!.channels.cache.get(pending.channelId) as TextChannel | undefined;
+      if (!targetChannel) {
+        pendingTicketSetups.delete(key);
+        await interaction.editReply('❌ The original channel is no longer available. Run `$ticketsetup` again.');
+        return;
+      }
+
+      const panel: PanelData = {
+        channelId: null,
+        messageId: null,
+        title: pending.title,
+        description: pending.description,
+        buttonLabel: pending.buttonLabel,
+        imageUrl: pending.imageUrl
+      };
+
+      let panelMessage: Message;
+      try {
+        panelMessage = await targetChannel.send({ embeds: [buildPanelEmbed(panel)], components: [buildPanelRow(panel)] });
+      } catch (e) {
+        console.error('ticketsetup: failed to build/send panel embed:', e);
+        const reason = e instanceof Error ? e.message : String(e);
+        pendingTicketSetups.delete(key);
+        await interaction.editReply(`❌ Couldn't create the panel: ${reason}`);
+        return;
+      }
+
+      panel.channelId = targetChannel.id;
+      panel.messageId = panelMessage.id;
+
+      updateGuildConfig(interaction.guild!.id, (g) => {
+        g.panel = panel;
+        g.claimRoles = claimRoles;
+        g.transcriptChannelId = transcriptChannelId;
+      });
+
+      pendingTicketSetups.delete(key);
+
+      notes.push(
+        transcriptChannelId
+          ? `Transcripts will be saved to <#${transcriptChannelId}> when tickets close.`
+          : 'No transcript channel set — closed tickets will not be logged.'
+      );
+
+      await interaction.editReply(
+        `✅ **Ticket panel created in ${targetChannel}!**\nClaim roles: ${claimRoles
+          .map((id) => `<@&${id}>`)
+          .join(', ')}\n${notes.join('\n')}`
+      );
       return;
     }
 
